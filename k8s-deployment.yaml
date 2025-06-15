@@ -1,0 +1,279 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring-service
+  namespace: fature
+  labels:
+    app: monitoring-service
+    component: monitoring
+    version: v1.0.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: monitoring-service
+  template:
+    metadata:
+      labels:
+        app: monitoring-service
+        component: monitoring
+    spec:
+      containers:
+      - name: monitoring-api
+        image: fature/monitoring-service:latest
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: monitoring-secrets
+              key: database-url
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: data-volume
+          mountPath: /app/data
+      volumes:
+      - name: config-volume
+        configMap:
+          name: monitoring-service-config
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: monitoring-data-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-service
+  namespace: fature
+  labels:
+    app: monitoring-service
+spec:
+  selector:
+    app: monitoring-service
+  ports:
+  - port: 80
+    targetPort: 5000
+    protocol: TCP
+    name: http
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitoring-service-config
+  namespace: fature
+  labels:
+    app: monitoring-service
+data:
+  config.yaml: |
+    # Configurações do serviço de monitoramento
+    monitoring:
+      retention_days: 90
+      batch_size_limit: 1000
+      alert_check_interval: 60
+      metrics_aggregation_interval: 300
+    
+    database:
+      pool_size: 10
+      max_overflow: 20
+      pool_timeout: 30
+      pool_recycle: 3600
+    
+    alerts:
+      default_severity: "medium"
+      notification_timeout: 30
+      max_retries: 3
+      retry_delay: 60
+    
+    logging:
+      level: INFO
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+      enable_audit_logs: true
+    
+    performance:
+      enable_query_optimization: true
+      cache_query_results: true
+      cache_ttl_seconds: 300
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: monitoring-secrets
+  namespace: fature
+  labels:
+    app: monitoring-service
+type: Opaque
+data:
+  database-url: c3FsaXRlOi8vL2FwcC9kYXRhL21vbml0b3JpbmcuZGI=  # sqlite:///app/data/monitoring.db
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: monitoring-data-pvc
+  namespace: fature
+  labels:
+    app: monitoring-service
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitoring-service-netpol
+  namespace: fature
+spec:
+  podSelector:
+    matchLabels:
+      app: monitoring-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          component: fature-services
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+    ports:
+    - protocol: TCP
+      port: 5000
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: monitoring-service-hpa
+  namespace: fature
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: monitoring-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: monitoring-service-pdb
+  namespace: fature
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: monitoring-service
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: monitoring-cleanup
+  namespace: fature
+  labels:
+    app: monitoring-service
+spec:
+  schedule: "0 2 * * *"  # Executa diariamente às 2h
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: fature/monitoring-service:latest
+            command:
+            - python
+            - scripts/cleanup_old_data.py
+            env:
+            - name: RETENTION_DAYS
+              value: "90"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: monitoring-secrets
+                  key: database-url
+          restartPolicy: OnFailure
+
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: monitoring-service-monitor
+  namespace: fature
+  labels:
+    app: monitoring-service
+spec:
+  selector:
+    matchLabels:
+      app: monitoring-service
+  endpoints:
+  - port: http
+    path: /api/metrics/prometheus
+    interval: 30s
+    scrapeTimeout: 10s
+
